@@ -1,0 +1,221 @@
+name: Build and Test (macOS only)
+
+on: [workflow_dispatch]
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.os == 'macos-13' && 4 || 3 }}
+
+jobs:
+  mac:
+    runs-on: ${{ matrix.os }}
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.os == 'macos-13' && 4 || 3 }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        qt:
+          - 5.9.9
+          - 5.10.1
+          - 5.11.3
+          - 5.12.12
+          - 5.13.2
+          - 5.14.2
+          - 5.15.2
+          - 6.2.4
+          - 6.3.2
+          - 6.4.3
+          - 6.5.3
+          - 6.6.3
+          - 6.7.3
+          - 6.8.3
+          - 6.9.1
+        os:
+          - macos-13
+          - macos-14
+          - macos-15
+        cc:
+          - clang
+          - gcc
+        exclude:
+          # GitHub's macOS 14+ gcc can only target arm64, but Qt didn't add Apple arm64 support until Qt 6.2, so:
+          # Exclude Qt 5.x (and 6.0, 6.1) with GCC on macOS 14+. Also see the `arch` step below for more details.
+          - { qt: '5.9.9',   os: macos-14, cc: gcc }
+          - { qt: '5.9.9',   os: macos-15, cc: gcc }
+          - { qt: '5.10.1',  os: macos-14, cc: gcc }
+          - { qt: '5.10.1',  os: macos-15, cc: gcc }
+          - { qt: '5.11.3',  os: macos-14, cc: gcc }
+          - { qt: '5.11.3',  os: macos-15, cc: gcc }
+          - { qt: '5.12.12', os: macos-14, cc: gcc }
+          - { qt: '5.12.12', os: macos-15, cc: gcc }
+          - { qt: '5.13.2',  os: macos-14, cc: gcc }
+          - { qt: '5.13.2',  os: macos-15, cc: gcc }
+          - { qt: '5.14.2',  os: macos-14, cc: gcc }
+          - { qt: '5.14.2',  os: macos-15, cc: gcc }
+          - { qt: '5.15.2',  os: macos-14, cc: gcc }
+          - { qt: '5.15.2',  os: macos-15, cc: gcc }
+          # Exclude Qt 5.10 with GCC on macOS. See https://bugreports.qt.io/browse/QTBUG-66585
+          - { qt: '5.10.1', cc: gcc }
+          # Exclude Qt 6.x with GCC on macOS for now. See https://bugreports.qt.io/browse/QTBUG-107050
+          - { qt: '6.2.4', cc: gcc }
+          - { qt: '6.3.2', cc: gcc }
+          - { qt: '6.4.3', cc: gcc }
+          - { qt: '6.5.3', cc: gcc }
+          - { qt: '6.6.3', cc: gcc }
+          - { qt: '6.7.3', cc: gcc }
+          - { qt: '6.8.3', cc: gcc }
+          - { qt: '6.9.1', cc: gcc }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install lcov
+        run: brew install bash lcov
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ matrix.qt }}
+          modules: ${{ startsWith(matrix.qt, '6') && 'qtconnectivity' || '' }}
+          documentation: true
+          doc-archives: >-
+            ${{ (startsWith(matrix.qt, '5.10.') || startsWith(matrix.qt, '5.11.')) && 'qt' ||
+                (startsWith(matrix.qt, '5') && 'qtcore qtbluetooth' || 'qtcore') }}
+          doc-modules: ${{ startsWith(matrix.qt, '6') && 'qtbluetooth' || '' }}
+          aqtversion: '>=3.2.0'
+      - name: Upload aqtinstall log file
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aqtinstall-log-${{ matrix.os }}-${{ matrix.cc }}-${{ matrix.qt }}
+          path: aqtinstall.log
+          if-no-files-found: error
+      - name: Choose target architectures
+        id: arch
+        run: |
+          if [[ '${{ matrix.qt }}' =~ ^(5|6\.[01])\. ]]; then arch=x86_64
+          elif [[ '${{ matrix.cc }}' == 'gcc' ]]; then
+            if [[ '${{ matrix.os }}' == 'macos-13' ]]; then arch='x86_64'; else arch='arm64'; fi
+          else arch='arm64;x86_64'; fi
+          tee -a "$GITHUB_ENV" <<< "CMAKE_OSX_ARCHITECTURES=${arch}"
+          tee -a "$GITHUB_OUTPUT" <<< "buildId=${arch//;/-}"
+      - name: Choose compiler toolchain
+        run: |
+          if [[ '${{ matrix.cc }}' == 'gcc' ]]; then
+            tee -a "$GITHUB_ENV" <<< 'CC=gcc-14'
+            tee -a "$GITHUB_ENV" <<< 'CXX=g++-14'
+            tee -a "$GITHUB_ENV" <<< 'GCOV=gcov-14'
+          else
+            case '${{ matrix.os }}' in
+              macos-13) llvmPrefix=$(brew --prefix 'llvm@15') ;;
+              macos-15) llvmPrefix=$(brew --prefix 'llvm@18') ;;
+              *) llvmPrefix='/Library/Developer/CommandLineTools/usr' ;;
+            esac
+            tee -a "$GITHUB_ENV" <<< "CC=${llvmPrefix}/bin/clang"
+            tee -a "$GITHUB_ENV" <<< "CXX=${llvmPrefix}/bin/clang++"
+            tee -a "$GITHUB_ENV" <<< "LLVM_COV=${llvmPrefix}/bin/llvm-cov"
+            tee -a "$GITHUB_ENV" <<< "LLVM_PROFDATA=${llvmPrefix}/bin/llvm-profdata"
+          fi
+      - name: Build
+        id: build
+        env:
+          PROJECT_BUILD_ID: "${{ github.run_number }}.${{ matrix.os }}.${{ steps.arch.outputs.buildId }}.${{ matrix.cc }}.qt-${{ matrix.qt }}"
+        run: |
+          [[ '${{ matrix.os }}' == 'macos-13' && '${{ matrix.cc }}' == 'clang' ]] ||
+          cmake -D CMAKE_BUILD_TYPE=Release \
+                -D CODECOV_GCOV="${GCOV:-}" \
+                -D ENABLE_COVERAGE=true \
+                -D LLVM_COV="${LLVM_COV:-}" \
+                -D LLVM_PROFDATA="${LLVM_PROFDATA:-}" \
+                -D QT_INSTALL_DOCS="$RUNNER_WORKSPACE/Qt/Docs/Qt-${{ matrix.qt }}" \
+                -S "$GITHUB_WORKSPACE" -B "$RUNNER_TEMP/coverage"
+          cmake -D CMAKE_BUILD_TYPE=Release \
+                -D ENABLE_COVERAGE=false \
+                -D QT_INSTALL_DOCS="$RUNNER_WORKSPACE/Qt/Docs/Qt-${{ matrix.qt }}" \
+                -S "$GITHUB_WORKSPACE" -B "$RUNNER_TEMP/release"
+          tee -a "$GITHUB_OUTPUT" <<< "dokitVersion=$(cat "$RUNNER_TEMP/release/version.txt")"
+          { echo -n 'tap='; [[ '${{ matrix.qt }}' =~ ^5\.1[2-9]|6 ]] && echo true || echo false; } |
+            tee -a "$GITHUB_OUTPUT"
+          [[ '${{ matrix.os }}' == 'macos-13' && '${{ matrix.cc }}' == 'clang' ]] ||
+            cmake --build "$RUNNER_TEMP/coverage" -- VERBOSE=1
+          cmake --build "$RUNNER_TEMP/release" -- VERBOSE=1
+          "$RUNNER_TEMP/release/src/cli/dokit.app/Contents/MacOS/dokit" --version
+          [[ '${{ matrix.os }}' == 'macos-13' && '${{ matrix.cc }}' == 'clang' ]] ||
+            "$RUNNER_TEMP/coverage/src/cli/dokit.app/Contents/MacOS/dokit" --version
+      - name: Grant Bluetooth access
+        if: matrix.os != 'macos-13' && ( startsWith(matrix.qt, '5') || startsWith(matrix.qt, '6.2.') )
+        run: >
+          sudo sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" "INSERT or REPLACE INTO access
+            ( service, client, client_type, auth_value, auth_reason, auth_version, flags ) VALUES
+            ( 'kTCCServiceBluetoothAlways', '/usr/local/opt/runner/provisioner/provisioner', 1, 2, 3, 1, 0 )"
+      - name: Test w/ coverage
+        if: matrix.os != 'macos-13' || matrix.cc != 'clang'
+        run: ctest --output-on-failure --test-dir "$RUNNER_TEMP/coverage" --verbose
+        timeout-minutes: 1
+      - name: Test w/o coverage
+        run: ctest --output-on-failure --test-dir "$RUNNER_TEMP/release" --verbose
+        timeout-minutes: 1
+      - name: Test localisations
+        if: startsWith(matrix.qt, '6')
+        run: |
+          declare -Ar languages=(
+            [en_AU]='Australia|Unrecognised'
+            [en_GB]='United Kingdom|Unrecognised'
+            [en_US]='United States|Unrecognized'
+          )
+          for langId in "${!languages[@]}"; do
+            IFS='|' read -r langName localText <<< "${languages[${langId}]}"
+            echo "Checking: ${langName} (${langId})"
+            output=$(
+              LANG="${langId}.UTF-8" \
+              "$RUNNER_TEMP/release/src/cli/dokit.app/Contents/MacOS/dokit" calibrate --debug --temperature x 2>&1 || :)
+            printf '%s\n--------\n' "${output}"
+            grep "Locale:.*${langName}" <<< "${output}"
+            grep "App translations: :/i18n/cli/${langId}\.qm" <<< "${output}"
+            grep "Library translations: :/i18n/lib/${langId}\.qm" <<< "${output}"
+            grep "${localText} temperature format" <<< "${output}"
+          done
+      - name: Disable lcov consistency checks for gcc
+        if: matrix.cc == 'gcc'
+        run: echo 'check_data_consistency = 0' >> "$HOME/.lcovrc"
+      - name: Collate test coverage
+        if: matrix.os != 'macos-13' || matrix.cc == 'gcc'
+        run: cmake --build "$RUNNER_TEMP/coverage" --target coverage
+      - name: Upload test results
+        if: matrix.os != 'macos-13' || fromJSON(steps.build.outputs.tap)
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ steps.build.outputs.dokitVersion }}
+          path: |
+            ${{ runner.temp }}/coverage/coverage.info
+            ${{ runner.temp }}/coverage/removeHtmlDates.sh
+            ${{ runner.temp }}/coverage/test/**/*.tap
+            ${{ runner.temp }}/release/test/**/*.tap
+          if-no-files-found: error
+      - name: Report parallel coverage to Codacy
+        if: >-
+          ( matrix.os != 'macos-13' || matrix.cc == 'gcc' )
+          && github.event_name == 'push' && github.actor != 'dependabot[bot]'
+        env:
+          CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
+        run: >
+          bash <(curl -Ls https://coverage.codacy.com/get.sh) report --partial \
+            -l CPP -r "${{ runner.temp }}/coverage/coverage.info"
+      - name: Report parallel coverage to Coveralls
+        if: >-
+          ( matrix.os != 'macos-13' || matrix.cc == 'gcc' )
+          && github.event_name == 'push' && github.actor != 'dependabot[bot]'
+        uses: coverallsapp/github-action@v2
+        with:
+          file: ${{ runner.temp }}/coverage/coverage.info
+          format: lcov
+          flag-name: mac-${{ matrix.cc }}-${{ matrix.qt }}
+          parallel: true
+      - name: Make app bundle
+        run: macdeployqt "$RUNNER_TEMP/release/src/cli/dokit.app" -dmg -verbose=2
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dokit-${{ steps.build.outputs.dokitVersion }}
+          path: ${{ runner.temp }}/release/src/cli/*.app
+          if-no-files-found: error
